@@ -21,6 +21,7 @@ import {
     type CreateRelationshipNodeType,
 } from '@/pages/editor-page/canvas/create-relationship-node/create-relationship-node';
 import { useEventEmitter } from 'ahooks';
+import { useLocalConfig } from '@/hooks/use-local-config';
 
 interface CanvasProviderProps {
     children: ReactNode;
@@ -35,13 +36,23 @@ export const CanvasProvider = ({ children }: CanvasProviderProps) => {
         areas,
         diagramId,
     } = useChartDB();
-    const { filter, loading: filterLoading } = useDiagramFilter();
+    const {
+        filter,
+        loading: filterLoading,
+        hasActiveFilter,
+    } = useDiagramFilter();
+    const { showDBViews } = useLocalConfig();
     const { fitView, screenToFlowPosition, setNodes } = useReactFlow();
     const [overlapGraph, setOverlapGraph] =
         useState<Graph<string>>(createGraph());
     const [editTableModeTable, setEditTableModeTable] = useState<{
         tableId: string;
         fieldId?: string;
+    } | null>(null);
+
+    const [editRelationshipPopover, setEditRelationshipPopover] = useState<{
+        relationshipId: string;
+        position: { x: number; y: number };
     } | null>(null);
 
     const events = useEventEmitter<CanvasEvent>();
@@ -66,8 +77,11 @@ export const CanvasProvider = ({ children }: CanvasProviderProps) => {
 
         diagramIdActiveFilterRef.current = diagramId;
 
-        setShowFilter(true);
-    }, [filterLoading, diagramId]);
+        // Only show filter if there's an active filter
+        if (hasActiveFilter) {
+            setShowFilter(true);
+        }
+    }, [filterLoading, diagramId, hasActiveFilter]);
 
     const reorderTables = useCallback(
         (
@@ -77,17 +91,18 @@ export const CanvasProvider = ({ children }: CanvasProviderProps) => {
         ) => {
             const newTables = adjustTablePositions({
                 relationships,
-                tables: tables.filter((table) =>
-                    filterTable({
-                        table: {
-                            id: table.id,
-                            schema: table.schema,
-                        },
-                        filter,
-                        options: {
-                            defaultSchema: defaultSchemas[databaseType],
-                        },
-                    })
+                tables: tables.filter(
+                    (table) =>
+                        filterTable({
+                            table: {
+                                id: table.id,
+                                schema: table.schema,
+                            },
+                            filter,
+                            options: {
+                                defaultSchema: defaultSchemas[databaseType],
+                            },
+                        }) && (showDBViews ? true : !table.isView)
                 ),
                 areas,
                 mode: 'all',
@@ -133,6 +148,7 @@ export const CanvasProvider = ({ children }: CanvasProviderProps) => {
             fitView,
             databaseType,
             areas,
+            showDBViews,
         ]
     );
 
@@ -156,6 +172,16 @@ export const CanvasProvider = ({ children }: CanvasProviderProps) => {
             );
             endFloatingEdgeCreation();
         }, [setNodes, endFloatingEdgeCreation]);
+
+    const openRelationshipPopover: CanvasContext['openRelationshipPopover'] =
+        useCallback(({ relationshipId, position }) => {
+            setEditRelationshipPopover({ relationshipId, position });
+        }, []);
+
+    const closeRelationshipPopover: CanvasContext['closeRelationshipPopover'] =
+        useCallback(() => {
+            setEditRelationshipPopover(null);
+        }, []);
 
     const showCreateRelationshipNode: CanvasContext['showCreateRelationshipNode'] =
         useCallback(
@@ -207,6 +233,9 @@ export const CanvasProvider = ({ children }: CanvasProviderProps) => {
                 showFilter,
                 editTableModeTable,
                 setEditTableModeTable,
+                openRelationshipPopover,
+                closeRelationshipPopover,
+                editRelationshipPopover,
                 tempFloatingEdge: tempFloatingEdge,
                 setTempFloatingEdge: setTempFloatingEdge,
                 startFloatingEdgeCreation: startFloatingEdgeCreation,

@@ -2,20 +2,32 @@ import React, { useCallback, useMemo, useEffect, useState } from 'react';
 import type { ExportImageContext, ImageType } from './export-image-context';
 import { exportImageContext } from './export-image-context';
 import { toJpeg, toPng, toSvg } from 'html-to-image';
-import { useReactFlow } from '@xyflow/react';
+import {
+    getNodesBounds,
+    getViewportForBounds,
+    useReactFlow,
+} from '@xyflow/react';
 import { useChartDB } from '@/hooks/use-chartdb';
 import { useFullScreenLoader } from '@/hooks/use-full-screen-spinner';
 import { useTheme } from '@/hooks/use-theme';
 import logoDark from '@/assets/logo-dark.png';
 import logoLight from '@/assets/logo-light.png';
 import type { EffectiveTheme } from '../theme-context/theme-context';
+import { useTranslation } from 'react-i18next';
+import { useToast } from '@/components/toast/use-toast';
+import { dedupeSvgDataUrlStyles } from './dedupe-svg-styles';
+
+// Above this many tables a full-diagram SVG export can take several seconds
+const LARGE_SVG_TABLE_COUNT = 100;
 
 export const ExportImageProvider: React.FC<React.PropsWithChildren> = ({
     children,
 }) => {
     const { hideLoader, showLoader } = useFullScreenLoader();
-    const { setNodes, getViewport } = useReactFlow();
+    const { setNodes, getViewport, getNodes, setViewport } = useReactFlow();
     const { effectiveTheme } = useTheme();
+    const { t } = useTranslation();
+    const { toast } = useToast();
     const { diagramName } = useChartDB();
     const [logoBase64, setLogoBase64] = useState<string>('');
 
@@ -87,6 +99,42 @@ export const ExportImageProvider: React.FC<React.PropsWithChildren> = ({
                 return;
             }
 
+            // The canvas only renders visible nodes, so for SVG fit the
+            // live viewport to all nodes first so every table is in the DOM
+            // (#1083). The original viewport is restored afterwards.
+            // Empty diagrams fall back to exporting the current viewport.
+            const visibleNodes = getNodes().filter((node) => !node.hidden);
+            const fitWholeDiagram = type === 'svg' && visibleNodes.length > 0;
+            if (
+                fitWholeDiagram &&
+                visibleNodes.filter((node) => node.type === 'table').length >
+                    LARGE_SVG_TABLE_COUNT
+            ) {
+                toast({
+                    description: t('export_image_dialog.large_svg_warning'),
+                });
+            }
+            if (fitWholeDiagram) {
+                // Let the loader and warning paint before the capture work
+                // blocks the main thread
+                await new Promise((resolve) =>
+                    requestAnimationFrame(() => setTimeout(resolve, 50))
+                );
+            }
+            const nodesBounds = getNodesBounds(visibleNodes);
+            if (fitWholeDiagram) {
+                await setViewport(
+                    getViewportForBounds(
+                        nodesBounds,
+                        reactFlowBounds.width,
+                        reactFlowBounds.height,
+                        0.01,
+                        2,
+                        0.05
+                    )
+                );
+            }
+
             const imageCreateFn = imageCreatorMap[type];
 
             setTimeout(async () => {
@@ -119,9 +167,50 @@ export const ExportImageProvider: React.FC<React.PropsWithChildren> = ({
                     'defs'
                 );
 
+                // Inline styles for marker elements before copying since skipFonts: true prevents CSS processing
+                const markerCircles = document.querySelectorAll(
+                    '.marker-definitions marker circle'
+                ) as NodeListOf<SVGCircleElement>;
+                const markerTexts = document.querySelectorAll(
+                    '.marker-definitions marker text'
+                ) as NodeListOf<SVGTextElement>;
+
+                const originalMarkerStyles: {
+                    element: SVGElement;
+                    fill: string;
+                    stroke: string;
+                }[] = [];
+
+                markerCircles.forEach((circle) => {
+                    const computedStyle = window.getComputedStyle(circle);
+                    originalMarkerStyles.push({
+                        element: circle,
+                        fill: circle.style.fill,
+                        stroke: circle.style.stroke,
+                    });
+                    circle.style.fill = computedStyle.fill;
+                    circle.style.stroke = computedStyle.stroke;
+                });
+
+                markerTexts.forEach((text) => {
+                    const computedStyle = window.getComputedStyle(text);
+                    originalMarkerStyles.push({
+                        element: text,
+                        fill: text.style.fill,
+                        stroke: text.style.stroke,
+                    });
+                    text.style.fill = computedStyle.fill;
+                });
+
                 if (markerDefs) {
                     defs.innerHTML = markerDefs.innerHTML;
                 }
+
+                // Restore original marker styles
+                originalMarkerStyles.forEach(({ element, fill, stroke }) => {
+                    element.style.fill = fill;
+                    element.style.stroke = stroke;
+                });
 
                 if (includePatternBG) {
                     const pattern = document.createElementNS(
@@ -185,22 +274,62 @@ export const ExportImageProvider: React.FC<React.PropsWithChildren> = ({
                     viewportElement.firstChild
                 );
 
+                // Inline stroke styles for edge paths since skipFonts: true prevents CSS processing
+                const edgePaths = viewportElement.querySelectorAll(
+                    '.react-flow__edge-path'
+                ) as NodeListOf<SVGPathElement>;
+                const originalStyles: {
+                    element: SVGPathElement;
+                    stroke: string;
+                    strokeWidth: string;
+                }[] = [];
+
+                edgePaths.forEach((path) => {
+                    const computedStyle = window.getComputedStyle(path);
+                    originalStyles.push({
+                        element: path,
+                        stroke: path.style.stroke,
+                        strokeWidth: path.style.strokeWidth,
+                    });
+                    path.style.stroke = computedStyle.stroke;
+                    path.style.strokeWidth = computedStyle.strokeWidth;
+                });
+
                 try {
                     // Handle SVG export differently
                     if (type === 'svg') {
+                        // Capture the whole diagram, not just the visible
+                        // viewport (#1083)
+                        const padding = 40;
+                        const svgWidth = fitWholeDiagram
+                            ? Math.ceil(nodesBounds.width + padding * 2)
+                            : reactFlowBounds.width;
+                        const svgHeight = fitWholeDiagram
+                            ? Math.ceil(nodesBounds.height + padding * 2)
+                            : reactFlowBounds.height;
+                        const fitted = fitWholeDiagram
+                            ? getViewportForBounds(
+                                  nodesBounds,
+                                  svgWidth,
+                                  svgHeight,
+                                  1,
+                                  1,
+                                  0
+                              )
+                            : viewport;
                         const dataUrl = await imageCreateFn(viewportElement, {
-                            width: reactFlowBounds.width,
-                            height: reactFlowBounds.height,
+                            width: svgWidth,
+                            height: svgHeight,
                             style: {
-                                width: `${reactFlowBounds.width}px`,
-                                height: `${reactFlowBounds.height}px`,
-                                transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`,
+                                width: `${svgWidth}px`,
+                                height: `${svgHeight}px`,
+                                transform: `translate(${fitted.x}px, ${fitted.y}px) scale(${fitted.zoom})`,
                             },
                             quality: 1,
                             pixelRatio: scale,
                             skipFonts: true,
                         });
-                        downloadImage(dataUrl, type);
+                        downloadImage(dedupeSvgDataUrlStyles(dataUrl), type);
                         return;
                     }
 
@@ -291,7 +420,17 @@ export const ExportImageProvider: React.FC<React.PropsWithChildren> = ({
                         };
                     });
                 } finally {
+                    // Restore original styles
+                    originalStyles.forEach(
+                        ({ element, stroke, strokeWidth }) => {
+                            element.style.stroke = stroke;
+                            element.style.strokeWidth = strokeWidth;
+                        }
+                    );
                     viewportElement.removeChild(tempSvg);
+                    if (fitWholeDiagram) {
+                        setViewport(viewport);
+                    }
                     hideLoader();
                 }
             }, 0);
@@ -300,12 +439,16 @@ export const ExportImageProvider: React.FC<React.PropsWithChildren> = ({
             getBackgroundColor,
             downloadImage,
             getViewport,
+            getNodes,
+            setViewport,
             hideLoader,
             imageCreatorMap,
             setNodes,
             showLoader,
             effectiveTheme,
             logoBase64,
+            t,
+            toast,
         ]
     );
 
